@@ -106,7 +106,7 @@ def plot_agent_schedule(data):
   fig = px.bar(  # Using px.bar from plotly express
       data,
       x='Arrival',
-      y='STATION_Duration (Mins)',
+      y='STATION_Duration',
       color='Agent_Name',
       title="Agent Schedule - Duration by Hour",
       barmode='group',
