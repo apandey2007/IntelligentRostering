@@ -1,111 +1,161 @@
 ## The files contain below columns:
-## Agent-Availability: Date	Agent_ID	Agent_Name	Shift_Timing_Start	Shift_Timing_End	Expertise
-## Contract-Information: Contract_Start_Date	Contract_End_Date	Airline_Name	STATION
-## Airline-Schedule:Date	Arrival	Flight	Airline
+## Agent-Availability: Date,Agent_ID, Agent_Name, Shift_Timing_Start, Shift_Timing_End, STATION, STATION_Duration
+## Contract-Information: Contract_Start_Date, Contract_End_Date, Airline, STATION
+## Airline-Schedule:Date, Arrival, Flight, Airline
 ## Step 1: Check Schedule information, select unique Airlines from schedule file; column name: "Airline"
-## Step 2: Merge with Contract, on="Airline" and remove those airlines from Schedule Information which do not have valid contract based on current date and "Contract_Start_Date" and "Contract_End_Date"
+## Step 2: Cross-check with Contract-Information file, on="Airline" and remove those airlines from Schedule Information which do not have valid contract based on current date and "Contract_Start_Date" and "Contract_End_Date"
 ## Step 3: Show these removed airlines and Reason for Rejection in a table in streamlit app
-## Step 4: Add a column "STATION" from the merge in Step 2, for all valid STATIONS for the airlines in contract
-## Step 5: Based on the flight schedule and STATION_Duration (the amount of time required to complete a STATION), map the available agent and showcase the agent which will be present based on fight schedule
-## Visualize the flight and associated agent in best possible chart
-## All this should be shown in the same streamlit application, with grid for uploading the three input excel files namely: Agent Availability, Airline Schedule and Contract Information with Airlines
+## Step 4: Add a column "STATION" from the merge in Step 2, for all valid STATIONS for each airline in Contract-Information
+## Step 5: Based on the flight arrival schedule and STATION_Duration (the amount of time required to complete a STATION), map the available agent based on their Shift_Stat_Time and Shift_End_Time and showcase the agent which will be present based on fight schedule
+## Visualize in a bar chart with the Hour of the day in x-axis, Duration across a STATION on y-axis, Agent-STATION mapping as color and a filter for date
+## All this should be shown in the same streamlit application, with grid for uploading the three input excel files namely: Agent-Availability, Airline-Schedule and Contract-Information with Airlines
+## After processing the data, the app should return button which allows an excel to be downloaded with below sheets:
+##  1. Valid Airlines for each day, 2. Airlines Invalid Contracts, 3. Agent Schedule showing "Date", "Agent", "Flight", "Airline", "Arrival", "STATION" and "STATION_Duration"
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
+from datetime import date
 import plotly.graph_objects as go
+import plotly.express as px
 from io import BytesIO
 
 
-# Function to read Excel files
-def read_excel(file):
-    df = pd.read_excel(file)
-    return df
+def get_data(file_uploader, header=0):
+  """Reads data from uploaded excel file"""
+  if file_uploader is not None:
+    try:
+      byte_data = file_uploader.read()
+      data = pd.read_excel(BytesIO(byte_data), header=header)
+      return data
+    except Exception as e:
+      st.error(f"Error reading file: {e}")
+      return None
+  else:
+    return None
+
+def filter_valid_contracts(schedule, contracts, today):
+  """Filters airlines with valid contracts based on current date"""
+  if schedule is not None and contracts is not None:
+    merged_data = schedule.merge(contracts[['Airline', 'Contract_Start_Date', 'Contract_End_Date']], how='left', on='Airline')
+
+    # Convert 'Contract_Start_Date' and 'Contract_End_Date' to datetime format (assuming they're strings)
+    merged_data['Contract_Start_Date'] = pd.to_datetime(merged_data['Contract_Start_Date'])
+    merged_data['Contract_End_Date'] = pd.to_datetime(merged_data['Contract_End_Date'])
+
+    # Extract the date part from both sides of the comparison for valid check
+    merged_data['Valid_Contract'] = (merged_data['Contract_Start_Date'].dt.date <= today) & (merged_data['Contract_End_Date'].dt.date >= today)
+    valid_airlines = merged_data[merged_data['Valid_Contract']]['Airline'].unique()
+    return schedule[schedule['Airline'].isin(valid_airlines)], merged_data[~merged_data['Valid_Contract']]
+  else:
+    return None, None
+
+def map_agents(flights, agents, contracts, today):
+  """Maps available agents based on flight arrival, shift timings, station duration, and agent availability"""
+  if flights is not None and agents is not None and contracts is not None:
+    # Convert 'today' to pandas Timestamp object
+    today_timestamp = pd.Timestamp(today)
+
+    # Filter flights with valid contracts based on airline and contract dates
+    valid_airlines = contracts[(contracts['Contract_Start_Date'] <= today_timestamp) &
+                               (contracts['Contract_End_Date'] >= today_timestamp)]['Airline']
+    valid_flights = flights[flights['Airline'].isin(valid_airlines)]
+
+    # Keep only the required stations for each flight of each valid airline
+    valid_stations = contracts[['Airline', 'STATION']].drop_duplicates()
+    valid_flights = valid_flights.merge(valid_stations, on='Airline')
+
+    # Merge agents with flights based on station
+    merged_data = valid_flights.merge(agents, how='cross', suffixes=('_flight', '_agent'))
+
+    # Filter agents based on shift timings
+    merged_data['Arrival_Time'] = pd.to_datetime(merged_data['Arrival'], format='%H:%M:%S', errors='coerce')
+    merged_data['Start_Time'] = pd.to_datetime(merged_data['Shift_Timing_Start'], format='%H:%M:%S', errors='coerce')
+    merged_data['End_Time'] = pd.to_datetime(merged_data['Shift_Timing_End'], format='%H:%M:%S', errors='coerce')
+
+    # Calculate the remaining available time for each agent based on station duration
+    merged_data['Available_Time'] = merged_data.apply(
+      lambda row: min((row['End_Time'] - row['Start_Time']).seconds / 3600,
+                      row['STATION_Duration']), axis=1)
+
+    # Filter agents whose shift timings overlap with flight arrival time and have enough available time
+    valid_agents = merged_data[(merged_data['Arrival_Time'] >= merged_data['Start_Time']) &
+                               (merged_data['Arrival_Time'] < merged_data['End_Time']) &
+                               (merged_data['Available_Time'] > 0) &
+                               (merged_data['STATION_flight'] == merged_data['STATION_agent'])]
+    valid_agents = valid_agents.reset_index().drop_duplicates()
+    return valid_agents[['Date_flight', 'Arrival', 'Flight', 'Airline', 'STATION_flight', 'STATION_agent', 'STATION_Duration', 'Agent_ID', 'Agent_Name']]
+  else:
+    return None
 
 
-# Function to visualize agent assignments as a bar chart
-def visualize_agent_assignments(agent_availability_df, airline_schedule_df, contract_info_df, selected_date):
-    # Combine date and time to create datetime objects for Shift_Timing_Start
-    agent_availability_df['Shift_Timing_Start'] = agent_availability_df['Date'] + pd.to_timedelta(agent_availability_df['Shift_Timing_Start'].astype(str))
-    # Combine date and time to create datetime objects for Shift_Timing_End
-    agent_availability_df['Shift_Timing_End'] = agent_availability_df['Date'] + pd.to_timedelta(agent_availability_df['Shift_Timing_End'].astype(str))
-    # Adjust Shift_Timing_End for cases where it represents the next day
-    next_day_mask = agent_availability_df['Shift_Timing_End'].dt.hour == 0
-    agent_availability_df.loc[next_day_mask, 'Shift_Timing_End'] += pd.Timedelta(days=1)
+def download_excel(data, sheet_names):
+  """Downloads data as an excel file with specified sheet names"""
+  # Create a BytesIO object to store the Excel file
+  excel_buffer = BytesIO()
+  with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+    for i, sheet_data in enumerate(data):
+      sheet_data.to_excel(writer, sheet_name=sheet_names[i], index=False)
+  # Seek to the beginning of the buffer
+  excel_buffer.seek(0)
+  # Provide the download button with the Excel file content
+  st.download_button(label="Download Excel", data=excel_buffer, file_name='Agents_Flight_Schedule.xlsx',
+                     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
-    agent_availability_df['Date'] = pd.to_datetime(agent_availability_df['Date'])
+def plot_agent_schedule(data):
+  """Creates a bar chart with plotly"""
+  fig = px.bar(  # Using px.bar from plotly express
+      data,
+      x='Arrival',
+      y='STATION_Duration (Mins)',
+      color='Agent_Name',
+      title="Agent Schedule - Duration by Hour",
+      barmode='group',
+      labels={
+          'Arrival': 'Hour of the Day',
+          'STATION_agent': 'STATION of Agent'
+      }
+  )
+  st.plotly_chart(fig)
 
-    filtered_agents = agent_availability_df[(agent_availability_df['Date'] == selected_date)]
+# App Title and File Upload
+st.title("Airline Schedule and Agent Availability")
 
-    # Create a list of agents and their assignments for each station
-    agent_assignments = []
-    for _, row in filtered_agents.iterrows():
-        for i in range(row['Shift_Timing_Start'].hour, row['Shift_Timing_End'].hour + 1):
-            agent_assignments.append(
-                {'Agent': row['Agent_Name'], 'Hour': i, 'Station': row['STATION'], 'Duration': row['STATION_Duration']})
+col1, col2, col3 = st.columns(3)
 
-    # Create a DataFrame from the list
-    agent_assignments_df = pd.DataFrame(agent_assignments)
+with col1:
+  agent_availability_file = st.file_uploader("Upload Agent Availability", type="xlsx")
 
-    # Group the DataFrame by agent and hour, and sum the durations for each station
-    grouped_df = agent_assignments_df.groupby(['Date','Flight', 'Airline','Arrival', 'Agent', 'Hour', 'Station']).sum().reset_index()
+with col2:
+  airline_schedule_file = st.file_uploader("Upload Airline Schedule", type="xlsx")
 
-    # Create a plot for each agent
-    fig = go.Figure()
+with col3:
+  contract_information_file = st.file_uploader("Upload Contract Information", type="xlsx")
 
-    for agent in grouped_df['Agent'].unique():
-        agent_data = grouped_df[grouped_df['Agent'] == agent]
-        for station in agent_data['Station'].unique():
-            station_data = agent_data[agent_data['Station'] == station]
-            fig.add_trace(go.Bar(x=station_data['Hour'], y=station_data['Duration'], name=agent + ' - ' + station))
+# Load data from uploaded files
+agent_availability_data = get_data(agent_availability_file)
+airline_schedule_data = get_data(airline_schedule_file)
+contract_information_data = get_data(contract_information_file)
 
-    # Update the layout
-    fig.update_layout(barmode='stack', xaxis_title='Hour of the Day', yaxis_title='Duration (Hours)',
-                      title='Agent Assignments for ' + selected_date.strftime('%Y-%m-%d'))
+# Check for errors in uploaded files
+if any(df is None for df in [agent_availability_data, airline_schedule_data, contract_information_data]):
+  st.error("Upload all files before processing!")
+else:
+  today = date.today()
 
-    # Display the plot
-    st.plotly_chart(fig)
+  # Filter airlines with valid contracts
+  filtered_schedule_data, invalid_contracts_data = filter_valid_contracts(airline_schedule_data.copy(), contract_information_data.copy(), today)
 
-    # Create Excel file
-    with BytesIO() as output:
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            # Write sheets
-            #valid_airlines.to_excel(writer, sheet_name="Flight_Schedule", index=False)
-            agent_assignments_df.to_excel(writer, sheet_name="Assigned_Agents", index=False)
+  # Map available agents based on flight arrival, timings, and station duration
+  processed_data = map_agents(filtered_schedule_data.copy(), agent_availability_data.copy(), contract_information_data, today)
 
-        # Retrieve the Excel file content as bytes
-        excel_content = output.getvalue()
+  # Download processed data (optional)
+  if st.button("Process Data"):
+    download_excel([processed_data, invalid_contracts_data], ["Processed_Data", "Invalid_Contracts"])
 
-    # Download the Excel file
-    st.download_button(label="Download Excel", data=excel_content, file_name="flight_schedule.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+  # # Display processed data (optional)
+  if invalid_contracts_data is not None:
+    st.dataframe(invalid_contracts_data[["Date", "Arrival", "Airline"]].drop_duplicates(), hide_index=True)
 
-
-def main():
-    # Title and description
-    st.title('Agent Assignments Visualization')
-    st.write('This application visualizes agent assignments based on contract information and agent availability.')
-
-    # Upload files
-    agent_availability_file = st.file_uploader('Upload Agent Availability Excel File', type=['xls', 'xlsx'])
-    airline_schedule_file = st.file_uploader('Upload Airline Schedule Excel File', type=['xls', 'xlsx'])
-    contract_info_file = st.file_uploader('Upload Contract Information Excel File', type=['xls', 'xlsx'])
-
-    if agent_availability_file and airline_schedule_file and contract_info_file:
-        # Read Excel files
-        agent_availability_df = read_excel(agent_availability_file)
-        airline_schedule_df = read_excel(airline_schedule_file)
-        contract_info_df = read_excel(contract_info_file)
-
-        # Filter unique dates from agent availability data
-        available_dates = agent_availability_df['Date'].dt.date.unique()
-
-        # Select date filter
-        selected_date = st.selectbox('Select Date', available_dates)
-
-        # Visualize agent assignments for selected date
-        visualize_agent_assignments(agent_availability_df, airline_schedule_df, contract_info_df,
-                                    pd.to_datetime(selected_date))
-
-
-if __name__ == "__main__":
-    main()
+  # Generate and display agent schedule chart (optional)
+  if processed_data is not None:
+    plot_agent_schedule(processed_data.copy())
